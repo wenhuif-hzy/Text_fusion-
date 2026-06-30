@@ -109,7 +109,7 @@ from data_interface import (
 from enhanced_itransformer import EnhancedITransformer
 
 
-CODE_VERSION = "frtc_ber_v53_daylight_context_protocol"
+CODE_VERSION = "frtc_ber_v54_general_event_sampling"
 METHOD_NAME = "FRTC-BER"
 METHOD_FULL_NAME = "Fuzzy Residual Text Correction with Budgeted Extreme-aware Release"
 METHOD_CORE_CLAIM = (
@@ -785,27 +785,18 @@ def _arg_was_provided(name: str) -> bool:
 def _apply_numeric_foundation_profile(args) -> None:
     """Select a robust numerical foundation before adding text residuals.
 
-    The compact profile preserves the original conservative residual chain.  The
-    robust profile adds history, NWP-physical, and periodic candidates and opens
-    their release gates.  Auto keeps kongzhaopu compact for backward
-    compatibility, but uses robust settings for multi-station training and for
-    stations that empirically need stronger numerical priors.
+    The compact profile preserves the conservative residual chain.  The robust
+    profile adds history, NWP-physical, and periodic candidates and opens their
+    release gates.  Auto now uses the same robust profile for every dataset, so
+    the numerical foundation is not selected by station name.
     """
     profile = str(getattr(args, "numeric_foundation_profile", "auto") or "auto").lower()
     if profile not in {"auto", "compact", "robust"}:
         raise ValueError(
             "--numeric_foundation_profile must be one of: auto, compact, robust"
         )
-    dataset_names = [
-        str(name).lower()
-        for name in getattr(args, "dataset_names", []) or [getattr(args, "dataset_name", "")]
-    ]
     if profile == "auto":
-        profile = "compact"
-        if bool(getattr(args, "multi_dataset", False)):
-            profile = "robust"
-        elif dataset_names and dataset_names[0] != "kongzhaopu":
-            profile = "robust"
+        profile = "robust"
     args.numeric_foundation_profile_effective = profile
 
     if profile != "robust":
@@ -839,24 +830,22 @@ def _apply_numeric_foundation_profile(args) -> None:
         "w_branch": 0.12,
         "w_residual": 0.20,
     }
-    event_focused_stations = {"hebei_station04", "hebei_station05", "yanfengdong"}
-    if dataset_names and dataset_names[0] in event_focused_stations and not _arg_was_provided("w_numeric_event"):
-        robust_float_defaults["w_numeric_event"] = 0.65
     for key, value in robust_float_defaults.items():
         if not _arg_was_provided(key):
             setattr(args, key, value)
+    robust_general_defaults = {
+        "use_dataset_conditioning": bool(getattr(args, "multi_dataset", False)),
+        "balanced_dataset_sampling": True,
+        "event_balanced_sampling": True,
+        "w_numeric_event": 0.58,
+        "w_non_degradation": 3.8,
+        "w_candidate_trust_sparse": 0.03,
+        "ema_decay": 0.985,
+    }
+    for key, value in robust_general_defaults.items():
+        if not _arg_was_provided(key):
+            setattr(args, key, value)
     if bool(getattr(args, "multi_dataset", False)):
-        robust_multiset_defaults = {
-            "use_dataset_conditioning": True,
-            "balanced_dataset_sampling": True,
-            "w_numeric_event": 0.55,
-            "w_non_degradation": 3.8,
-            "w_candidate_trust_sparse": 0.03,
-            "ema_decay": 0.985,
-        }
-        for key, value in robust_multiset_defaults.items():
-            if not _arg_was_provided(key):
-                setattr(args, key, value)
         if not _arg_was_provided("epochs"):
             args.epochs = max(int(getattr(args, "epochs", 40)), 50)
         if not _arg_was_provided("patience"):
@@ -1295,15 +1284,32 @@ def forecasting_loss(
     return 0.8 * mse + 0.2 * huber
 
 
-def target_ramp_focus(target: torch.Tensor, future_time_features: torch.Tensor) -> torch.Tensor:
+def target_event_focus(target: torch.Tensor, future_time_features: torch.Tensor) -> torch.Tensor:
     daylight = (daylight_weight(future_time_features, 2.0) - 1.0).clamp(0.0, 1.0)
+    level_abs = target.abs()
+    level_scale = level_abs.mean(dim=1, keepdim=True).detach().clamp_min(1e-3)
+    level_focus = torch.sigmoid((level_abs - 1.10 * level_scale) / 0.12)
     ramp = torch.zeros_like(target)
     if target.shape[1] > 1:
         ramp[:, 1:] = target[:, 1:] - target[:, :-1]
     ramp_abs = ramp.abs()
     scale = ramp_abs.mean(dim=1, keepdim=True).detach().clamp_min(1e-3)
-    focus = torch.sigmoid((ramp_abs - 0.70 * scale) / 0.05)
+    ramp_focus = torch.sigmoid((ramp_abs - 0.70 * scale) / 0.05)
+    curvature = torch.zeros_like(target)
+    if target.shape[1] > 2:
+        curvature[:, 2:] = target[:, 2:] - 2.0 * target[:, 1:-1] + target[:, :-2]
+    curvature_abs = curvature.abs()
+    curvature_scale = curvature_abs.mean(dim=1, keepdim=True).detach().clamp_min(1e-3)
+    curvature_focus = torch.sigmoid((curvature_abs - 0.75 * curvature_scale) / 0.05)
+    focus = torch.maximum(
+        0.45 * level_focus + 0.40 * ramp_focus + 0.15 * curvature_focus,
+        ramp_focus,
+    )
     return (focus * (0.20 + 0.80 * daylight)).detach()
+
+
+def target_ramp_focus(target: torch.Tensor, future_time_features: torch.Tensor) -> torch.Tensor:
+    return target_event_focus(target, future_time_features)
 
 
 def event_weighted_forecasting_loss(
@@ -1316,7 +1322,7 @@ def event_weighted_forecasting_loss(
     base = forecasting_loss(prediction, target, future_time_features, daytime_weight)
     if event_strength <= 0.0:
         return base
-    focus = target_ramp_focus(target, future_time_features)
+    focus = target_event_focus(target, future_time_features)
     weight = 1.0 + float(event_strength) * focus
     mse = torch.mean(weight * (prediction - target).square())
     ramp_pred = torch.zeros_like(prediction)
@@ -6164,11 +6170,12 @@ class SolarUnifiedTextFusionModel(nn.Module):
         weights,
     ) -> Tuple[torch.Tensor, Dict[str, float]]:
         training_prediction = prediction if self.use_text2_correction else parts["stage1_text_prediction"]
-        main = forecasting_loss(
+        main = event_weighted_forecasting_loss(
             training_prediction,
             batch["y"],
             batch["future_time_features"],
             weights.daytime_weight,
+            0.55 * weights.numeric_event,
         )
         realtime_target = batch["y"] - parts["stage1_prediction"].detach()
         realtime_abs = realtime_target.detach().abs()
@@ -8335,6 +8342,10 @@ def make_solar_loaders(args, text1_cache=None, text2_cache=None):
             use_text2=text2_cache is not None,
             strict_frequency=True,
             balanced_train_sampling=bool(getattr(args, "balanced_dataset_sampling", True)),
+            event_balanced_sampling=bool(getattr(args, "event_balanced_sampling", True)),
+            event_sample_quantile=float(getattr(args, "event_sample_quantile", 0.70)),
+            event_sample_alpha=float(getattr(args, "event_sample_alpha", 1.50)),
+            event_sample_max_weight=float(getattr(args, "event_sample_max_weight", 4.00)),
             prediction_start_hour=args.prediction_start_hour,
             prediction_end_hour=args.prediction_end_hour,
             prediction_include_end=bool(args.prediction_include_end),
@@ -8358,6 +8369,10 @@ def make_solar_loaders(args, text1_cache=None, text2_cache=None):
         use_text1=text1_cache is not None,
         use_text2=text2_cache is not None,
         strict_frequency=True,
+        event_balanced_sampling=bool(getattr(args, "event_balanced_sampling", True)),
+        event_sample_quantile=float(getattr(args, "event_sample_quantile", 0.70)),
+        event_sample_alpha=float(getattr(args, "event_sample_alpha", 1.50)),
+        event_sample_max_weight=float(getattr(args, "event_sample_max_weight", 4.00)),
         prediction_start_hour=args.prediction_start_hour,
         prediction_end_hour=args.prediction_end_hour,
         prediction_include_end=bool(args.prediction_include_end),
@@ -11823,6 +11838,10 @@ def run_paper_mainline(args):
     residual intervention and Regime-Pareto release.
     """
     ensure_dir(args.out_dir)
+    if _arg_was_provided("baseline_ckpt"):
+        args.paper_retrain_baseline = False
+    if _arg_was_provided("text1_ckpt"):
+        args.paper_retrain_text1 = False
     if bool(getattr(args, "paper_retrain_baseline", False)):
         args.baseline_ckpt = None
     if bool(getattr(args, "paper_retrain_text1", False)):
@@ -11833,10 +11852,6 @@ def run_paper_mainline(args):
         baseline_candidates = [
             os.path.join(args.baseline_out_dir, ACCEPTED_CHECKPOINT_NAME),
         ]
-        if not bool(getattr(args, "multi_dataset", False)) and getattr(args, "dataset_names", [""])[0] == "kongzhaopu":
-            baseline_candidates.append(
-                os.path.join("./results", "main_results", "kongzhaopu", "00_numeric_baseline", ACCEPTED_CHECKPOINT_NAME)
-            )
         for candidate in baseline_candidates:
             if _checkpoint_matches_current_data(candidate, args):
                 args.baseline_ckpt = candidate
@@ -11846,10 +11861,6 @@ def run_paper_mainline(args):
         text1_candidates = [
             os.path.join(args.text1_out_dir, ACCEPTED_CHECKPOINT_NAME),
         ]
-        if not bool(getattr(args, "multi_dataset", False)) and getattr(args, "dataset_names", [""])[0] == "kongzhaopu":
-            text1_candidates.append(
-                os.path.join("./results", "main_results", "kongzhaopu", "01_realtime_text1", ACCEPTED_CHECKPOINT_NAME)
-            )
         for candidate in text1_candidates:
             if _checkpoint_matches_current_data(candidate, args):
                 args.text1_ckpt = candidate
@@ -12063,8 +12074,8 @@ def parse_args():
         choices=["auto", "compact", "robust"],
         default="auto",
         help=(
-            "Numerical backbone profile. auto keeps kongzhaopu compact and uses "
-            "robust history/NWP/periodic priors for other stations or multi-dataset runs."
+            "Numerical backbone profile. auto uses the dataset-agnostic robust "
+            "history/NWP/periodic prior configuration."
         ),
     )
     parser.add_argument("--use_history_backbone", action=argparse.BooleanOptionalAction, default=False)
@@ -12073,6 +12084,10 @@ def parse_args():
     parser.add_argument("--use_numerical_candidate_pool", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--use_dataset_conditioning", action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument("--balanced_dataset_sampling", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--event_balanced_sampling", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--event_sample_quantile", type=float, default=0.70)
+    parser.add_argument("--event_sample_alpha", type=float, default=1.50)
+    parser.add_argument("--event_sample_max_weight", type=float, default=4.00)
     parser.add_argument("--use_aux_residual", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--use_past_nwp_residual", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--use_future_nwp_residual", action=argparse.BooleanOptionalAction, default=True)
@@ -12108,8 +12123,8 @@ def parse_args():
     parser.add_argument("--force_calibration_name", default="")
     parser.add_argument("--force_calibration_variant", default="")
     parser.add_argument("--force_release_scale", type=float, default=-1.0)
-    parser.add_argument("--paper_retrain_baseline", action=argparse.BooleanOptionalAction, default=False)
-    parser.add_argument("--paper_retrain_text1", action=argparse.BooleanOptionalAction, default=False)
+    parser.add_argument("--paper_retrain_baseline", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--paper_retrain_text1", action=argparse.BooleanOptionalAction, default=True)
     return parser.parse_args()
 
 

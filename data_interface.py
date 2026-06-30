@@ -810,6 +810,9 @@ class DatasetOptions:
     prediction_start_hour: Optional[float] = 8.0
     prediction_end_hour: Optional[float] = 19.0
     prediction_include_end: bool = True
+    event_sample_quantile: float = 0.70
+    event_sample_alpha: float = 1.50
+    event_sample_max_weight: float = 4.00
 
 
 class FusionDataset(Dataset):
@@ -885,6 +888,68 @@ class FusionDataset(Dataset):
         if len(candidates):
             candidates = self._filter_prediction_window(candidates)
         self.indices = candidates
+
+    def event_sampling_weights(
+        self,
+        quantile: Optional[float] = None,
+        alpha: Optional[float] = None,
+        max_weight: Optional[float] = None,
+    ) -> np.ndarray:
+        """Return target-distribution weights for training-only event sampling.
+
+        The score is computed in normalized target space from each supervised
+        window's level, ramp, and curvature.  It is dataset-relative and does
+        not depend on station names, so the same rule can be used for single-
+        and multi-station training.  These weights are only consumed by the
+        DataLoader sampler; inference never receives them.
+        """
+        if len(self.indices) == 0:
+            return np.zeros(0, dtype=np.float64)
+        q = float(self.options.event_sample_quantile if quantile is None else quantile)
+        a = float(self.options.event_sample_alpha if alpha is None else alpha)
+        cap = float(self.options.event_sample_max_weight if max_weight is None else max_weight)
+        if a <= 0.0 or cap <= 1.0:
+            return np.ones(len(self.indices), dtype=np.float64)
+        scores: List[float] = []
+        for start in self.indices:
+            p0 = int(start) + self.options.seq_len
+            p1 = p0 + self.options.pred_len
+            target = np.asarray(self.y_all[p0:p1, 0], dtype=np.float64)
+            if target.size == 0:
+                scores.append(0.0)
+                continue
+            target = np.where(np.isfinite(target), target, 0.0)
+            level = float(np.nanpercentile(np.abs(target), 90))
+            if target.size > 1:
+                ramp = np.diff(target)
+                ramp_score = float(np.nanpercentile(np.abs(ramp), 95))
+            else:
+                ramp_score = 0.0
+            if target.size > 2:
+                curvature = np.diff(target, n=2)
+                curvature_score = float(np.nanpercentile(np.abs(curvature), 95))
+            else:
+                curvature_score = 0.0
+            score = (
+                0.44 * np.tanh(level / 2.5)
+                + 0.40 * np.tanh(ramp_score / 0.80)
+                + 0.16 * np.tanh(curvature_score / 0.55)
+            )
+            scores.append(float(score))
+        score_array = np.asarray(scores, dtype=np.float64)
+        if not np.isfinite(score_array).any():
+            return np.ones(len(self.indices), dtype=np.float64)
+        score_array = np.where(np.isfinite(score_array), score_array, 0.0)
+        threshold = float(np.quantile(score_array, np.clip(q, 0.0, 0.98)))
+        high = float(np.quantile(score_array, 0.95))
+        width = max(high - threshold, 1e-6)
+        focus = np.clip((score_array - threshold) / width, 0.0, 1.0)
+        weights = 1.0 + a * focus
+        weights = np.clip(weights, 1.0, cap)
+        mean = float(weights.mean()) if weights.size else 1.0
+        if mean > 0.0:
+            weights = weights / mean
+        return weights.astype(np.float64)
 
     def __len__(self) -> int:
         return len(self.indices)
@@ -1108,6 +1173,10 @@ def make_loaders(
     prediction_start_hour: Optional[float] = 8.0,
     prediction_end_hour: Optional[float] = 19.0,
     prediction_include_end: bool = True,
+    event_balanced_sampling: bool = True,
+    event_sample_quantile: float = 0.70,
+    event_sample_alpha: float = 1.50,
+    event_sample_max_weight: float = 4.00,
 ):
     df = load_context_target_numeric(primary_csv, aux_csv, nwp_csv, context_csv, target_col)
     validate_columns(df, [*feature_cols, *nwp_cols, TARGET_VALUE_COL], primary_csv)
@@ -1135,6 +1204,9 @@ def make_loaders(
         prediction_start_hour=prediction_start_hour,
         prediction_end_hour=prediction_end_hour,
         prediction_include_end=prediction_include_end,
+        event_sample_quantile=event_sample_quantile,
+        event_sample_alpha=event_sample_alpha,
+        event_sample_max_weight=event_sample_max_weight,
     )
     # Window starts are chosen so the first target is exactly at the split boundary.
     train_range = (0, n_train - seq_len - pred_len + 1)
@@ -1173,7 +1245,28 @@ def make_loaders(
         pin_memory=torch.cuda.is_available(),
         persistent_workers=num_workers > 0,
     )
-    train_loader = DataLoader(train_ds, shuffle=True, drop_last=False, **loader_args)
+    train_sampler = None
+    train_shuffle = True
+    if event_balanced_sampling and event_sample_alpha > 0.0:
+        sample_weights = train_ds.event_sampling_weights(
+            quantile=event_sample_quantile,
+            alpha=event_sample_alpha,
+            max_weight=event_sample_max_weight,
+        )
+        if sample_weights.size:
+            train_sampler = WeightedRandomSampler(
+                torch.as_tensor(sample_weights, dtype=torch.double),
+                num_samples=len(sample_weights),
+                replacement=True,
+            )
+            train_shuffle = False
+    train_loader = DataLoader(
+        train_ds,
+        shuffle=train_shuffle,
+        sampler=train_sampler,
+        drop_last=False,
+        **loader_args,
+    )
     val_loader = DataLoader(val_ds, shuffle=False, drop_last=False, **loader_args)
     test_loader = DataLoader(test_ds, shuffle=False, drop_last=False, **loader_args)
     metadata = {
@@ -1206,6 +1299,10 @@ def make_loaders(
             "nearest_hourly_forecast_valid_time_tokens_over_horizon;"
             "source_must_be_available_at_forecast_issue_time"
         ),
+        "event_balanced_sampling": bool(event_balanced_sampling),
+        "event_sample_quantile": float(event_sample_quantile),
+        "event_sample_alpha": float(event_sample_alpha),
+        "event_sample_max_weight": float(event_sample_max_weight),
         "train_drop_last": False,
     }
     return train_loader, val_loader, test_loader, x_scaler, y_scaler, nwp_scaler, metadata
@@ -1233,6 +1330,10 @@ def make_multi_loaders(
     prediction_start_hour: Optional[float] = 8.0,
     prediction_end_hour: Optional[float] = 19.0,
     prediction_include_end: bool = True,
+    event_balanced_sampling: bool = True,
+    event_sample_quantile: float = 0.70,
+    event_sample_alpha: float = 1.50,
+    event_sample_max_weight: float = 4.00,
 ):
     """Build loaders for multiple independent solar stations.
 
@@ -1298,6 +1399,9 @@ def make_multi_loaders(
         prediction_start_hour=prediction_start_hour,
         prediction_end_hour=prediction_end_hour,
         prediction_include_end=prediction_include_end,
+        event_sample_quantile=event_sample_quantile,
+        event_sample_alpha=event_sample_alpha,
+        event_sample_max_weight=event_sample_max_weight,
     )
     train_sets: List[FusionDataset] = []
     val_sets: List[FusionDataset] = []
@@ -1357,15 +1461,29 @@ def make_multi_loaders(
     )
     train_sampler = None
     train_shuffle = True
-    if balanced_train_sampling:
+    if balanced_train_sampling or (event_balanced_sampling and event_sample_alpha > 0.0):
         sample_weights: List[float] = []
         for train_set in train_sets:
-            per_item = 1.0 / max(len(train_set), 1)
-            sample_weights.extend([per_item] * len(train_set))
+            if balanced_train_sampling:
+                base = np.full(len(train_set), 1.0 / max(len(train_set), 1), dtype=np.float64)
+            else:
+                base = np.ones(len(train_set), dtype=np.float64)
+            if event_balanced_sampling and event_sample_alpha > 0.0:
+                event_weights = train_set.event_sampling_weights(
+                    quantile=event_sample_quantile,
+                    alpha=event_sample_alpha,
+                    max_weight=event_sample_max_weight,
+                )
+                base = base * event_weights
+            sample_weights.extend(base.tolist())
         if sample_weights:
+            weights = np.asarray(sample_weights, dtype=np.float64)
+            total = float(weights.sum())
+            if total > 0.0:
+                weights = weights * (len(weights) / total)
             train_sampler = WeightedRandomSampler(
-                torch.as_tensor(sample_weights, dtype=torch.double),
-                num_samples=len(sample_weights),
+                torch.as_tensor(weights, dtype=torch.double),
+                num_samples=len(weights),
                 replacement=True,
             )
             train_shuffle = False
@@ -1417,6 +1535,10 @@ def make_multi_loaders(
             "source_must_be_available_at_forecast_issue_time"
         ),
         "balanced_train_sampling": bool(balanced_train_sampling),
+        "event_balanced_sampling": bool(event_balanced_sampling),
+        "event_sample_quantile": float(event_sample_quantile),
+        "event_sample_alpha": float(event_sample_alpha),
+        "event_sample_max_weight": float(event_sample_max_weight),
         "train_drop_last": False,
     }
     return train_loader, val_loader, test_loader, x_scaler, y_scaler, nwp_scaler, metadata

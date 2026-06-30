@@ -8982,7 +8982,7 @@ def load_fusion_model(
             setattr(saved, key, value)
     defaults = {
         "seq_len": 96,
-        "pred_len": 44,
+        "pred_len": 45,
         "d_model": 128,
         "n_heads": 4,
         "d_ff": 512,
@@ -11974,10 +11974,10 @@ def parse_args():
     parser.add_argument("--text2_ckpt", default=None)
 
     parser.add_argument("--seq_len", type=int, default=96)
-    parser.add_argument("--pred_len", type=int, default=44)
+    parser.add_argument("--pred_len", type=int, default=45)
     parser.add_argument("--prediction_start_hour", type=float, default=8.0)
     parser.add_argument("--prediction_end_hour", type=float, default=19.0)
-    parser.add_argument("--prediction_include_end", action=argparse.BooleanOptionalAction, default=False)
+    parser.add_argument("--prediction_include_end", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--batch_size", type=int, default=128)
     parser.add_argument("--epochs", type=int, default=40)
     parser.add_argument("--lr", type=float, default=1e-4)

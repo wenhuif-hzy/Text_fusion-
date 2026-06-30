@@ -803,13 +803,13 @@ def _gather_token_embeddings(
 @dataclass(frozen=True)
 class DatasetOptions:
     seq_len: int = 96
-    pred_len: int = 44
+    pred_len: int = 45
     sample_minutes: int = 15
     strict_frequency: bool = True
     text_tolerance_minutes: int = 50
     prediction_start_hour: Optional[float] = 8.0
     prediction_end_hour: Optional[float] = 19.0
-    prediction_include_end: bool = False
+    prediction_include_end: bool = True
 
 
 class FusionDataset(Dataset):
@@ -1107,7 +1107,7 @@ def make_loaders(
     val_ratio: float = 0.1,
     prediction_start_hour: Optional[float] = 8.0,
     prediction_end_hour: Optional[float] = 19.0,
-    prediction_include_end: bool = False,
+    prediction_include_end: bool = True,
 ):
     df = load_context_target_numeric(primary_csv, aux_csv, nwp_csv, context_csv, target_col)
     validate_columns(df, [*feature_cols, *nwp_cols, TARGET_VALUE_COL], primary_csv)
@@ -1232,7 +1232,7 @@ def make_multi_loaders(
     balanced_train_sampling: bool = True,
     prediction_start_hour: Optional[float] = 8.0,
     prediction_end_hour: Optional[float] = 19.0,
-    prediction_include_end: bool = False,
+    prediction_include_end: bool = True,
 ):
     """Build loaders for multiple independent solar stations.
 

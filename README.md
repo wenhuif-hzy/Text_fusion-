@@ -8,7 +8,7 @@ Code version: `frtc_ber_v53_daylight_context_protocol`
 
 This project forecasts photovoltaic `OT` with a 15-minute numerical stream and hourly text streams. The current method is not the old step-by-step data stacking route. It uses a stable numerical foundation first, then lets text act as forecast-time residual evidence.
 
-Default supervised targets cover `[08:00, 19:00)` at 15-minute resolution, so `pred_len=44`. The input context remains `seq_len=96`, i.e. a full 24-hour numerical/NWP history before the forecast origin. This lets the 08:00 forecast use early-morning context such as 06:00-07:45 without training or evaluating on nighttime targets.
+Default supervised targets cover `[08:00, 19:00]` at 15-minute resolution, so `pred_len=45`. The first forecast point is 08:00 and the last forecast point is 19:00. The input context remains `seq_len=96`, i.e. a full 24-hour numerical/NWP history before the forecast origin. This lets the 08:00 forecast use early-morning context such as 06:00-07:45 without training or evaluating on nighttime targets.
 
 ## Project Structure
 
@@ -50,7 +50,7 @@ The code follows one integrated framework:
 Main training selection and reported MSE/MAE are computed in normalized target
 space. For multi-dataset runs, each station has its own target scaler, so
 reported errors are comparable across stations and are not dominated by station
-capacity. The default supervised forecast window is `[08:00, 19:00)` at
+capacity. The default supervised forecast window is `[08:00, 19:00]` at
 15-minute resolution, while the numerical context window remains 24 hours. If
 `context_full_day.csv` exists for a station, it is used as the full-day context
 source; `solar.csv` remains the supervised target source. Checkpoints are

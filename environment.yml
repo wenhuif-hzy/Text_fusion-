@@ -1,0 +1,16 @@
+name: text_fusion
+channels:
+  - conda-forge
+  - pytorch
+  - nvidia
+dependencies:
+  - python=3.10
+  - pip
+  - numpy=2.2.6
+  - pandas=2.3.3
+  - pip:
+      - torch>=2.1
+      - transformers==5.9.0
+      - safetensors==0.7.0
+      - tokenizers==0.22.2
+
